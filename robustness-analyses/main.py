@@ -5,6 +5,7 @@ import json
 import pathlib
 import itertools
 import os
+from urllib.parse import parse_qs, urlparse
 from typing import Literal
 
 import typer
@@ -112,10 +113,20 @@ def _get_client(provider: str) -> openai.AsyncOpenAI:
         api_key = os.getenv("AZURE_OPENAI_API_KEY")
         if not api_key:
             raise EnvironmentError("Set the AZURE_OPENAI_API_KEY environment variable.")
-        endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-        if not endpoint:
+        endpoint_raw = os.getenv("AZURE_OPENAI_ENDPOINT")
+        if not endpoint_raw:
             raise EnvironmentError("Set the AZURE_OPENAI_ENDPOINT environment variable.")
-        api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2025-04-01-preview")
+        endpoint_raw = endpoint_raw.strip()
+        parsed = urlparse(endpoint_raw)
+        if not parsed.scheme or not parsed.netloc:
+            raise EnvironmentError("AZURE_OPENAI_ENDPOINT must be a valid Azure OpenAI URL.")
+
+        endpoint = f"{parsed.scheme}://{parsed.netloc}"
+
+        api_version = os.getenv("AZURE_OPENAI_API_VERSION")
+        if not api_version:
+            query_api_versions = parse_qs(parsed.query).get("api-version", [])
+            api_version = query_api_versions[0] if query_api_versions else "2025-04-01-preview"
 
         # Quick connectivity check
         import urllib.request
