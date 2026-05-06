@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "accelerate>=1.11.0",
     "ipykernel>=7.2.0",
     "kaleido>=1.2.0",
     "nbformat>=5.10.4",
@@ -14,6 +15,8 @@ dependencies = [
     "plotly>=6.6.0",
     "rich>=14.3.3",
     "seaborn>=0.13.2",
+    "torch>=2.8.0",
     "tqdm>=4.67.3",
+    "transformers>=4.56.0",
     "typer>=0.24.1",
 ]

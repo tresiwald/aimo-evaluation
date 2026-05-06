@@ -6,7 +6,7 @@ import pathlib
 import itertools
 import os
 from urllib.parse import parse_qs, urlparse
-from typing import Literal
+from typing import Any, Literal
 
 import typer
 import numpy as np
@@ -29,11 +29,109 @@ def load_df(file_path: pathlib.Path) -> pd.DataFrame:
         raise ValueError(f"Unsupported file format: {file_path.suffix}")
 
 
+class LocalHFClient:
+    """Thin async wrapper around a locally loaded Hugging Face causal LM."""
+
+    def __init__(self, model_name: str) -> None:
+        try:
+            import torch
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+        except ImportError as exc:
+            raise ImportError(
+                "Local Hugging Face inference requires `transformers` and `torch`. "
+                "Install project dependencies again after updating `pyproject.toml`."
+            ) from exc
+
+        self._torch = torch
+        self.model_name = model_name
+        self.max_new_tokens_default = int(os.getenv("LOCAL_HF_MAX_NEW_TOKENS", "4096"))
+        dtype_name = os.getenv("LOCAL_HF_TORCH_DTYPE", "auto")
+        model_kwargs: dict[str, Any] = {"device_map": os.getenv("LOCAL_HF_DEVICE_MAP", "auto")}
+        if dtype_name != "auto":
+            if not hasattr(torch, dtype_name):
+                raise ValueError(f"Unsupported LOCAL_HF_TORCH_DTYPE={dtype_name!r}")
+            model_kwargs["torch_dtype"] = getattr(torch, dtype_name)
+        attn_impl = os.getenv("LOCAL_HF_ATTN_IMPLEMENTATION")
+        if attn_impl:
+            model_kwargs["attn_implementation"] = attn_impl
+
+        typer.secho(f"Loading local Hugging Face model {model_name}...", fg="cyan")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.model = AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
+        self.model.eval()
+
+    def _render_prompt(self, system_prompt: str, user_content: str) -> str:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ]
+        if hasattr(self.tokenizer, "apply_chat_template"):
+            try:
+                return self.tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            except Exception:
+                pass
+        return f"{system_prompt}\n\n{user_content}\n"
+
+    def _generate_sync(
+        self,
+        system_prompt: str,
+        user_content: str,
+        temperature: float,
+        max_completion_tokens: int | None,
+        seed: int | None,
+    ) -> tuple[str, None, str]:
+        prompt = self._render_prompt(system_prompt, user_content)
+        inputs = self.tokenizer(prompt, return_tensors="pt")
+        device = next(self.model.parameters()).device
+        inputs = {key: value.to(device) for key, value in inputs.items()}
+
+        generation_kwargs: dict[str, Any] = {
+            "max_new_tokens": max_completion_tokens or self.max_new_tokens_default,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "do_sample": temperature > 0,
+        }
+        if temperature > 0:
+            generation_kwargs["temperature"] = temperature
+        if seed is not None:
+            self._torch.manual_seed(seed)
+
+        with self._torch.inference_mode():
+            output = self.model.generate(**inputs, **generation_kwargs)
+
+        input_length = inputs["input_ids"].shape[1]
+        generated_tokens = output[0][input_length:]
+        prediction = self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+        return prediction, None, "stop"
+
+    async def generate(
+        self,
+        system_prompt: str,
+        user_content: str,
+        temperature: float,
+        max_completion_tokens: int | None,
+        seed: int | None,
+    ) -> tuple[str, None, str]:
+        return await asyncio.to_thread(
+            self._generate_sync,
+            system_prompt,
+            user_content,
+            temperature,
+            max_completion_tokens,
+            seed,
+        )
+
+
 async def call_llm(
     system_prompt: str,
     user_content: str,
     problem_id: str,
-    client: openai.AsyncOpenAI,
+    client: Any,
     model: str,
     temperature: float,
     reasoning_effort: str,
@@ -45,25 +143,34 @@ async def call_llm(
     """Call LLM API with retries on failure."""
     for attempt in range(1, max_retries + 1):
         try:
-            extras = {}
-            if seed is not None:
-                extras["seed"] = seed
-            response = await client.chat.completions.create(
-                model=model,
-                temperature=temperature,
-                max_completion_tokens=max_completion_tokens,
-                reasoning_effort=reasoning_effort,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_content},
-                ],
-                timeout=2*60*60,
-                **extras
-            )
-            out = response.choices[0]
-            prediction = out.message.content
-            reasoning_content = out.message.reasoning_content if hasattr(out.message, "reasoning_content") else None
-            finish_reason = out.finish_reason
+            if isinstance(client, LocalHFClient):
+                prediction, reasoning_content, finish_reason = await client.generate(
+                    system_prompt=system_prompt,
+                    user_content=user_content,
+                    temperature=temperature,
+                    max_completion_tokens=max_completion_tokens,
+                    seed=seed,
+                )
+            else:
+                extras = {}
+                if seed is not None:
+                    extras["seed"] = seed
+                response = await client.chat.completions.create(
+                    model=model,
+                    temperature=temperature,
+                    max_completion_tokens=max_completion_tokens,
+                    reasoning_effort=reasoning_effort,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_content},
+                    ],
+                    timeout=2*60*60,
+                    **extras
+                )
+                out = response.choices[0]
+                prediction = out.message.content
+                reasoning_content = out.message.reasoning_content if hasattr(out.message, "reasoning_content") else None
+                finish_reason = out.finish_reason
 
             if prediction is None:
                 prediction = ""
@@ -92,8 +199,8 @@ async def run_bounded(coros, max_concurrency: int):
         yield await fut
 
 
-def _get_client(provider: str) -> openai.AsyncOpenAI:
-    """Instantiate an async OpenAI-compatible client for the given provider."""
+def _get_client(provider: str, model_name: str) -> Any:
+    """Instantiate a client for the given provider."""
     if provider == "google":
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
@@ -104,10 +211,16 @@ def _get_client(provider: str) -> openai.AsyncOpenAI:
         )
     
     if provider == "einfra":
+        api_key = os.getenv("EINFRA_AI_TOKEN")
+        if not api_key:
+            raise EnvironmentError("Set the EINFRA_AI_TOKEN environment variable.")
         return openai.AsyncOpenAI(
-            api_key = os.getenv("EINFRA_AI_TOKEN"),
+            api_key = api_key,
             base_url = "https://llm.ai.e-infra.cz/v1/"
         )
+
+    if provider == "huggingface-local":
+        return LocalHFClient(model_name)
 
     if provider == "openai":
         api_key = os.getenv("AZURE_OPENAI_API_KEY")
@@ -147,7 +260,10 @@ def _get_client(provider: str) -> openai.AsyncOpenAI:
             api_version=api_version,
         )
 
-    raise ValueError(f"Unknown provider: {provider!r}. Choose 'openai' or 'google'.")
+    raise ValueError(
+        f"Unknown provider: {provider!r}. Choose one of "
+        "'openai', 'google', 'einfra', or 'huggingface-local'."
+    )
 
 
 def extract_answer(response: str) -> str:
@@ -209,7 +325,14 @@ def augment(
         raise FileExistsError(f"Output file {output_filename} already exists. Please remove it before running the script.")
 
     typer.secho("Initializing the client...", fg="cyan")
-    client = _get_client(provider)
+    client = _get_client(provider, api_model)
+    if provider == "huggingface-local" and max_concurrency != 1:
+        typer.secho(
+            f"Provider {provider} runs against one local model instance; overriding "
+            f"max_concurrency from {max_concurrency} to 1.",
+            fg="yellow",
+        )
+        max_concurrency = 1
 
     records = df.to_dict(orient="records")
     total = len(records) * n_variants
@@ -304,7 +427,14 @@ def predict(
                 raise ValueError(f"Unknown value for `--on-file-exists`: {on_file_exists}")
 
     typer.secho("Initializing the client...", fg="cyan")
-    client = _get_client(provider)
+    client = _get_client(provider, api_model)
+    if provider == "huggingface-local" and max_concurrency != 1:
+        typer.secho(
+            f"Provider {provider} runs against one local model instance; overriding "
+            f"max_concurrency from {max_concurrency} to 1.",
+            fg="yellow",
+        )
+        max_concurrency = 1
 
     records = df.to_dict(orient="records")
     total = len(records) * n_repeats

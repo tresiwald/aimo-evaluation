@@ -37,6 +37,26 @@ python robustness-analyses/main.py predict \
     --n-repeats 10
 ```
 
+Predictions with a locally loaded Hugging Face model:
+
+```shell
+python robustness-analyses/main.py predict \
+    data/gsm-symbolic-reference.jsonl \
+    predictions/ \
+    --provider huggingface-local \
+    --api-model "Qwen/Qwen2-0.5B" \
+    --n-repeats 1 \
+    --max-concurrency 1
+```
+
+This provider loads the model directly via `transformers`, so you need local model dependencies installed and enough CPU/GPU memory for the selected checkpoint. Optional environment variables:
+
+```shell
+export LOCAL_HF_DEVICE_MAP=auto
+export LOCAL_HF_TORCH_DTYPE=bfloat16
+export LOCAL_HF_MAX_NEW_TOKENS=4096
+```
+
 Predictions for augmented problems:
 
 ```shell
@@ -109,4 +129,3 @@ Rows are included when either:
 The thresholds must be disjoint enough to keep the merged label unambiguous, so the script requires `max_drop_robust < min_drop_nonrobust`.
 
 The script always runs built-in data-consistency checks as part of normal execution and fails loudly if it finds malformed filenames, missing fields, inconsistent original questions, variant collisions, or broken base/augmentation alignment.
-
