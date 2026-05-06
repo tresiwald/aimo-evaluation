@@ -57,6 +57,34 @@ export LOCAL_HF_TORCH_DTYPE=bfloat16
 export LOCAL_HF_MAX_NEW_TOKENS=4096
 ```
 
+Predictions with an arbitrary OpenAI-compatible endpoint:
+
+```shell
+export OPENAI_COMPATIBLE_BASE_URL="https://your-host.example/v1"
+export OPENAI_COMPATIBLE_API_KEY="your-api-key"
+
+python robustness-analyses/main.py predict \
+    data/gsm-symbolic-reference.jsonl \
+    predictions/ \
+    --provider openai-compatible \
+    --api-model "your-model-id" \
+    --n-repeats 1
+```
+
+Smoke-test only a subset of rows and write to a distinct prediction file:
+
+```shell
+python robustness-analyses/main.py predict \
+    data/gsm-symbolic-reference.jsonl \
+    predictions/ \
+    --provider openai-compatible \
+    --api-model "your-model-id" \
+    --row-offset 0 \
+    --max-rows 5 \
+    --output-suffix smoke \
+    --n-repeats 1
+```
+
 Predictions for augmented problems:
 
 ```shell

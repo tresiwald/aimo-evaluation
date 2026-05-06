@@ -18,6 +18,11 @@ import rich.pretty
 
 app = typer.Typer()
 
+
+def sanitize_filename_component(value: str) -> str:
+    """Make a model or prompt identifier safe to embed in a filename."""
+    return value.replace("/", "__")
+
 def load_df(file_path: pathlib.Path) -> pd.DataFrame:
     if file_path.suffix == ".csv":
         return pd.read_csv(file_path)
@@ -219,6 +224,18 @@ def _get_client(provider: str, model_name: str) -> Any:
             base_url = "https://llm.ai.e-infra.cz/v1/"
         )
 
+    if provider == "openai-compatible":
+        api_key = os.getenv("OPENAI_COMPATIBLE_API_KEY")
+        if not api_key:
+            raise EnvironmentError("Set the OPENAI_COMPATIBLE_API_KEY environment variable.")
+        base_url = os.getenv("OPENAI_COMPATIBLE_BASE_URL")
+        if not base_url:
+            raise EnvironmentError("Set the OPENAI_COMPATIBLE_BASE_URL environment variable.")
+        return openai.AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+        )
+
     if provider == "huggingface-local":
         return LocalHFClient(model_name)
 
@@ -262,7 +279,7 @@ def _get_client(provider: str, model_name: str) -> Any:
 
     raise ValueError(
         f"Unknown provider: {provider!r}. Choose one of "
-        "'openai', 'google', 'einfra', or 'huggingface-local'."
+        "'openai', 'google', 'einfra', 'openai-compatible', or 'huggingface-local'."
     )
 
 
@@ -320,7 +337,10 @@ def augment(
     df = load_df(base_problems_file)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    output_filename = output_dir / f"{base_problems_file.stem}___{prompt_file.stem}={api_model}:{reasoning_effort}.jsonl"
+    output_filename = output_dir / (
+        f"{base_problems_file.stem}___{prompt_file.stem}="
+        f"{sanitize_filename_component(api_model)}:{reasoning_effort}.jsonl"
+    )
     if output_filename.exists():
         raise FileExistsError(f"Output file {output_filename} already exists. Please remove it before running the script.")
 
@@ -400,6 +420,9 @@ def predict(
     system_prompt_file: pathlib.Path | None = "./prompts/solve.txt",
     on_file_exists: Literal["error", "fill-missing", "overwrite"] = "error",
     seeding: bool = True,
+    row_offset: int = 0,
+    max_rows: int | None = None,
+    output_suffix: str | None = None,
 ) -> None:
     
     typer.secho(f"Loading system prompt from {system_prompt_file}...", fg="cyan")
@@ -409,8 +432,19 @@ def predict(
     typer.secho(f"Loading problems from {problems_file}...", fg="cyan")
     df = load_df(problems_file)
 
+    if row_offset < 0:
+        raise ValueError(f"row_offset must be non-negative, got {row_offset}")
+    if max_rows is not None and max_rows <= 0:
+        raise ValueError(f"max_rows must be positive when provided, got {max_rows}")
+
     pred_dir.mkdir(parents=True, exist_ok=True)
-    pred_file = pred_dir / f"{problems_file.stem}___eval={api_model}:{reasoning_effort}.jsonl"
+    pred_filename = (
+        f"{problems_file.stem}___eval="
+        f"{sanitize_filename_component(api_model)}:{reasoning_effort}"
+    )
+    if output_suffix:
+        pred_filename += f"___{sanitize_filename_component(output_suffix)}"
+    pred_file = pred_dir / f"{pred_filename}.jsonl"
 
     existing_df = None
     if pred_file.exists():
@@ -435,6 +469,15 @@ def predict(
             fg="yellow",
         )
         max_concurrency = 1
+
+    if row_offset > 0 or max_rows is not None:
+        end_idx = None if max_rows is None else row_offset + max_rows
+        df = df.iloc[row_offset:end_idx].reset_index(drop=True)
+        typer.secho(
+            f"Using subset rows [{row_offset}:{'end' if end_idx is None else end_idx}] "
+            f"from {problems_file}.",
+            fg="cyan",
+        )
 
     records = df.to_dict(orient="records")
     total = len(records) * n_repeats
