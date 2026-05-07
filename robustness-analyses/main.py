@@ -311,6 +311,12 @@ def answers_match(expected, predicted: str) -> bool:
     return normalize(expected) == normalize(predicted)
 
 
+def series_mean_or_nan(series: pd.Series) -> float:
+    """Return a plain float mean, preserving NaN for empty slices."""
+    value = series.mean()
+    return float(value)
+
+
 @app.command()
 def augment(
     base_problems_file: pathlib.Path,
@@ -549,7 +555,7 @@ def eval(
     report = {
         "unique_problems": pred_df["id"].nunique(),
         "total_problems": len(pred_df),
-        "acc": pred_df["is_correct"].mean().item(),
+        "acc": series_mean_or_nan(pred_df["is_correct"]),
     }
 
     if base_pred_file is None:
@@ -565,10 +571,10 @@ def eval(
         unsolved_mask = ~pred_df["base_is_correct"]
 
         report.update({
-            "acc_base": base_df["is_correct"].mean().item(),
-            "acc_delta": pred_df["is_correct"].mean().item() - base_df["is_correct"].mean().item(),
-            "acc_on_base_solved": pred_df.loc[solved_mask, "is_correct"].mean().item(),
-            "acc_on_base_unsolved": pred_df.loc[unsolved_mask, "is_correct"].mean().item(),
+            "acc_base": series_mean_or_nan(base_df["is_correct"]),
+            "acc_delta": series_mean_or_nan(pred_df["is_correct"]) - series_mean_or_nan(base_df["is_correct"]),
+            "acc_on_base_solved": series_mean_or_nan(pred_df.loc[solved_mask, "is_correct"]),
+            "acc_on_base_unsolved": series_mean_or_nan(pred_df.loc[unsolved_mask, "is_correct"]),
             "n_problems_improved": (pred_df["is_correct"] & ~pred_df["base_is_correct"]).groupby(pred_df["id"]).any().sum(),
             "n_problems_broken": (~pred_df["is_correct"] & pred_df["base_is_correct"]).groupby(pred_df["id"]).any().sum(),
         })
