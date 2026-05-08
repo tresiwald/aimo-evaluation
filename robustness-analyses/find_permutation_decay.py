@@ -131,11 +131,11 @@ def parse_prediction_filename(path: pathlib.Path) -> dict[str, str | None]:
         break
 
     if augmentation_token is None:
-        if dataset_id.endswith("-reference"):
+        if dataset_id == "gsm-symbolic-reference":
             dataset_id = dataset_id[: -len("-reference")]
             augmentation_type = "base"
             augmentation_source = None
-        elif "-permutations" in dataset_id:
+        elif dataset_id.startswith("gsm-symbolic-permutations"):
             base_dataset_id, permutation_suffix = dataset_id.split("-permutations", 1)
             assert base_dataset_id, f"Missing base dataset id in filename: {path.name}"
             dataset_id = base_dataset_id
