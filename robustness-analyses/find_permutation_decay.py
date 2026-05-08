@@ -131,8 +131,19 @@ def parse_prediction_filename(path: pathlib.Path) -> dict[str, str | None]:
         break
 
     if augmentation_token is None:
-        augmentation_type = "base"
-        augmentation_source = None
+        if dataset_id.endswith("-reference"):
+            dataset_id = dataset_id[: -len("-reference")]
+            augmentation_type = "base"
+            augmentation_source = None
+        elif "-permutations" in dataset_id:
+            base_dataset_id, permutation_suffix = dataset_id.split("-permutations", 1)
+            assert base_dataset_id, f"Missing base dataset id in filename: {path.name}"
+            dataset_id = base_dataset_id
+            augmentation_type = f"permutations{permutation_suffix}"
+            augmentation_source = None
+        else:
+            augmentation_type = "base"
+            augmentation_source = None
     elif "=" in augmentation_token:
         augmentation_type, augmentation_source = augmentation_token.split("=", 1)
         assert augmentation_type, f"Missing augmentation type in filename: {path.name}"
@@ -1002,4 +1013,3 @@ def main(
 
 if __name__ == "__main__":
     app()
-
