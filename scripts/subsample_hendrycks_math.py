@@ -12,9 +12,11 @@ DATA_DIR = ROOT / "data"
 
 TRAIN_INPUT_PATH = DATA_DIR / "hendrycks-math-train-reference.jsonl"
 TEST_INPUT_PATH = DATA_DIR / "hendrycks-math-test-reference.jsonl"
+TRAIN_OUTPUT_500_PATH = DATA_DIR / "hendrycks-math-train-reference-500.jsonl"
 TRAIN_OUTPUT_PATH = DATA_DIR / "hendrycks-math-train-reference-1000.jsonl"
 TEST_OUTPUT_PATH = DATA_DIR / "hendrycks-math-test-reference-100.jsonl"
 
+TRAIN_SAMPLE_500_SIZE = 500
 TRAIN_SAMPLE_SIZE = 1000
 TEST_SAMPLE_SIZE = 100
 RNG_SEED = 0
@@ -44,12 +46,15 @@ def main() -> None:
     train_rows = load_jsonl(TRAIN_INPUT_PATH)
     test_rows = load_jsonl(TEST_INPUT_PATH)
 
+    train_sample_500 = subsample_rows(train_rows, TRAIN_SAMPLE_500_SIZE, RNG_SEED)
     train_sample = subsample_rows(train_rows, TRAIN_SAMPLE_SIZE, RNG_SEED)
     test_sample = subsample_rows(test_rows, TEST_SAMPLE_SIZE, RNG_SEED)
 
+    write_jsonl(TRAIN_OUTPUT_500_PATH, train_sample_500)
     write_jsonl(TRAIN_OUTPUT_PATH, train_sample)
     write_jsonl(TEST_OUTPUT_PATH, test_sample)
 
+    print(f"wrote {TRAIN_OUTPUT_500_PATH} ({len(train_sample_500)} rows)")
     print(f"wrote {TRAIN_OUTPUT_PATH} ({len(train_sample)} rows)")
     print(f"wrote {TEST_OUTPUT_PATH} ({len(test_sample)} rows)")
     print(f"seed: {RNG_SEED}")
