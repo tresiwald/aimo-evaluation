@@ -845,6 +845,75 @@ def build_robust_group_row(
     }
 
 
+def build_group_label_row(
+    *,
+    model_id: str,
+    dataset_id: str,
+    problem_id: str,
+    base: BaseProblemStats,
+    cases: list[tuple[str, str, AugmentedProblemStats]],
+    max_drop_robust: float,
+) -> dict[str, Any] | None:
+    """Construct one aggregated row per problem with a binary robustness label."""
+    if not cases:
+        return None
+
+    base_accuracy = base.stats.accuracy
+    permuted_accuracies: list[float] = []
+    absolute_decays: list[float] = []
+    relative_decays: list[float] = []
+    permuted_prediction_counts: list[int] = []
+    detrimental_variants: list[dict[str, Any]] = []
+    paired_types_and_sources = sorted(
+        (
+            augmentation_type,
+            resolve_effective_permutation_source(augmentation_type, augmentation_source),
+        )
+        for augmentation_type, augmentation_source, _ in cases
+    )
+    permutation_types = [augmentation_type for augmentation_type, _ in paired_types_and_sources]
+    permutation_sources = [augmentation_source for _, augmentation_source in paired_types_and_sources]
+    original_problem = base.original_question or cases[0][2].original_question
+
+    is_robust = base_accuracy == 1.0
+    for augmentation_type, augmentation_source, aug in cases:
+        permuted_accuracy = aug.stats.accuracy
+        absolute_decay = base_accuracy - permuted_accuracy
+        if absolute_decay > max_drop_robust:
+            is_robust = False
+
+        permuted_accuracies.append(permuted_accuracy)
+        absolute_decays.append(absolute_decay)
+        relative_decays.append(absolute_decay / base_accuracy if base_accuracy else 0.0)
+        permuted_prediction_counts.append(aug.stats.total)
+        detrimental_variants.extend(
+            _collect_detrimental_variants(
+                augmentation_type=augmentation_type,
+                augmentation_source=augmentation_source or "n/a",
+                base_accuracy=base_accuracy,
+                aug=aug,
+            )
+        )
+
+    return {
+        "model_id": model_id,
+        "dataset_id": dataset_id,
+        "problem_id": problem_id,
+        "original_problem": original_problem,
+        "permutation_type": json.dumps(permutation_types, ensure_ascii=False),
+        "permutation_source": json.dumps(permutation_sources, ensure_ascii=False),
+        "base_accuracy": round(base_accuracy, 6),
+        "permuted_accuracy": round(sum(permuted_accuracies) / len(permuted_accuracies), 6),
+        "absolute_accuracy_decay": round(sum(absolute_decays) / len(absolute_decays), 6),
+        "relative_accuracy_decay": round(sum(relative_decays) / len(relative_decays), 6),
+        "n_base_predictions": base.stats.total,
+        "n_permuted_predictions": sum(permuted_prediction_counts),
+        "n_detrimental_permutations": len(detrimental_variants),
+        "permutations_causing_decay": json.dumps(detrimental_variants, ensure_ascii=False),
+        "model_is_robust": is_robust,
+    }
+
+
 def _write_csv(path: pathlib.Path, fieldnames: list[str], rows: list[dict[str, Any]]) -> None:
     """Write a CSV report with a fixed schema."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -884,6 +953,11 @@ def main(
         "--push-to-hub",
         help="Save the final table as a local HuggingFace DatasetDict validation split. The code contains a commented push_to_hub example for manual upload.",
     ),
+    label_all_problems: bool = typer.Option(
+        False,
+        "--label-all-problems",
+        help="Emit exactly one aggregated row per problem with a binary model_is_robust label.",
+    ),
 ) -> None:
     # Run a lightweight end-to-end consistency check on a synthetic fixture
     # before touching the real prediction directory.
@@ -909,6 +983,58 @@ def main(
     n_base_perfect_problems = 0
     n_robust_rows = 0
     n_decay_rows = 0
+
+    if label_all_problems:
+        for dataset_id, model_id, problem_id in sorted(grouped_cases):
+            base = base_stats.get((dataset_id, model_id, problem_id))
+            assert base is not None, (
+                "Missing base stats for grouped label analysis of "
+                f"{dataset_id}/{model_id}/{problem_id}"
+            )
+            row = build_group_label_row(
+                model_id=model_id,
+                dataset_id=dataset_id,
+                problem_id=problem_id,
+                base=base,
+                cases=grouped_cases[(dataset_id, model_id, problem_id)],
+                max_drop_robust=max_drop_robust,
+            )
+            if row is None:
+                continue
+            merged_rows.append(row)
+            n_robust_rows += int(bool(row["model_is_robust"]))
+            n_decay_rows += int(not bool(row["model_is_robust"]))
+        remapped_merged_rows = [remap_output_row_model_ids(row) for row in merged_rows]
+        _write_csv(output_csv, [
+            "model_is_robust",
+            "model_id",
+            "dataset_id",
+            "problem_id",
+            "original_problem",
+            "permutation_type",
+            "permutation_source",
+            "base_accuracy",
+            "permuted_accuracy",
+            "absolute_accuracy_decay",
+            "relative_accuracy_decay",
+            "n_base_predictions",
+            "n_permuted_predictions",
+            "n_detrimental_permutations",
+            "permutations_causing_decay",
+        ], remapped_merged_rows)
+        dataset_dir = output_dataset_dir
+        if dataset_dir is None:
+            dataset_dir = output_csv.parent / f"{output_csv.stem}_hf_dataset"
+        if push_to_hub:
+            _write_hf_validation_dataset(dataset_dir, remapped_merged_rows)
+            typer.echo(f"Saved HuggingFace validation dataset to {dataset_dir}")
+        typer.echo(f"Wrote {len(remapped_merged_rows)} labeled rows to {output_csv}")
+        typer.echo(
+            f"Assigned {n_robust_rows} robust and {n_decay_rows} non-robust labels "
+            f"(max_drop_robust={max_drop_robust:.3f})."
+        )
+        return
+
     for key, aug in sorted(augmented_stats.items()):
         dataset_id, model_id, problem_id, augmentation_type, augmentation_source = key
         base = base_stats.get((dataset_id, model_id, problem_id))
