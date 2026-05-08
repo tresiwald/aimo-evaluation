@@ -164,6 +164,9 @@ def parse_prediction_filename(path: pathlib.Path) -> dict[str, str | None]:
 
 def variant_key(row: dict[str, Any]) -> str:
     if "question_variant_idx" in row and row["question_variant_idx"] is not None:
+        config = row.get("question_config")
+        if config:
+            return f"{config}:{row['question_variant_idx']}"
         return str(row["question_variant_idx"])
     return row.get("question", "")
 
