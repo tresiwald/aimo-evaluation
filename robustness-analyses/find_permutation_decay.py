@@ -318,6 +318,24 @@ def load_prediction_data(predictions_dir: pathlib.Path) -> tuple[
                 if not variant.question:
                     variant.question = question_text
 
+    missing_base_keys = [
+        key
+        for key in augmented_stats
+        if (key[0], key[1], key[2]) not in base_stats
+    ]
+    if missing_base_keys:
+        sample = ", ".join(
+            f"{dataset_id}/{model_id}/{problem_id}/{augmentation_type}/{augmentation_source}"
+            for dataset_id, model_id, problem_id, augmentation_type, augmentation_source in missing_base_keys[:5]
+        )
+        print(
+            "Warning: skipping augmented problems without matching base predictions "
+            f"({len(missing_base_keys)} cases). Sample: {sample}"
+        )
+        augmented_stats = {
+            key: value for key, value in augmented_stats.items() if key not in missing_base_keys
+        }
+
     validate_alignment(base_stats, augmented_stats)
 
     return base_stats, augmented_stats
