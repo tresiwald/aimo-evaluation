@@ -226,8 +226,8 @@ def load_prediction_data(predictions_dir: pathlib.Path) -> tuple[
     base_stats: dict[tuple[str, str, str], BaseProblemStats] = {}
     # Augmented problems split further by permutation type and source model.
     augmented_stats: dict[tuple[str, str, str, str, str], AugmentedProblemStats] = {}
-    prediction_files = sorted(predictions_dir.glob("*___eval=*.jsonl"))
-    assert prediction_files, f"No prediction files matching '*___eval=*.jsonl' found in {predictions_dir}"
+    prediction_files = sorted(predictions_dir.rglob("*___eval=*.jsonl"))
+    assert prediction_files, f"No prediction files matching '**/*___eval=*.jsonl' found in {predictions_dir}"
 
     for path in prediction_files:
         meta = parse_prediction_filename(path)
@@ -1002,5 +1002,4 @@ def main(
 
 if __name__ == "__main__":
     app()
-
 
