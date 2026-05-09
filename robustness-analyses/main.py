@@ -5,6 +5,7 @@ import json
 import pathlib
 import itertools
 import os
+import re
 from urllib.parse import parse_qs, urlparse
 from typing import Any, Literal
 
@@ -18,10 +19,97 @@ import rich.pretty
 
 app = typer.Typer()
 
+MESSAGE_MARKER_RE = re.compile(r"<\|message\|>", re.IGNORECASE)
+SPECIAL_TOKEN_RE = re.compile(r"<\|[^>]+?\|>")
+ROLE_MARKER_RE = re.compile(
+    r"(?is)(?:^|\n)\s*(analysis|assistant|final|user)\s*(?::|\n)",
+)
+QUESTION_START_RE = re.compile(
+    r"(?is)\b("
+    r"what|which|who|when|where|why|how|suppose|if|let|given|compute|find|determine|evaluate|prove|show|"
+    r"a\s+regular|in\s+triangle|triangle|consider"
+    r")\b"
+)
+PROBLEM_END_RE = re.compile(r"(?s)[.?!](?:[)\]\"']+)?(?:\s|$)")
+
 
 def sanitize_filename_component(value: str) -> str:
     """Make a model or prompt identifier safe to embed in a filename."""
     return value.replace("/", "__")
+
+
+def _strip_outer_quotes(text: str) -> str:
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
+        return text[1:-1].strip()
+    return text
+
+
+def _normalize_candidate_text(text: str) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if MESSAGE_MARKER_RE.search(text):
+        text = MESSAGE_MARKER_RE.split(text)[-1].strip()
+    text = SPECIAL_TOKEN_RE.sub(" ", text)
+    text = ROLE_MARKER_RE.sub("\n", text)
+    text = _strip_outer_quotes(text.strip())
+    return re.sub(r"[ \t]+", " ", text).strip()
+
+
+def _find_problem_start(text: str) -> int | None:
+    match = QUESTION_START_RE.search(text)
+    if match is None:
+        return None
+    return match.start()
+
+
+def clean_augmented_question(raw_text: str, original_question: str) -> str:
+    """Trim rambling/tool-output wrappers and keep only the final problem text."""
+    text = _normalize_candidate_text(str(raw_text))
+    if not text:
+        return text
+
+    # Fast path: already looks like one compact problem.
+    if (
+        "\n" not in text
+        and "assistant" not in text.lower()
+        and "analysis" not in text.lower()
+        and _find_problem_start(text) in (None, 0)
+    ):
+        return text
+
+    lines = [line.strip(" \"'") for line in text.splitlines() if line.strip()]
+    compact = "\n".join(lines).strip()
+
+    # If the model echoed the original question at the end, prefer the tail from the
+    # last plausible problem-statement start rather than the earlier reasoning.
+    start_idx = _find_problem_start(compact)
+    if start_idx is not None:
+        tail = compact[start_idx:].strip(" \"'")
+        if len(tail) >= max(20, len(original_question) // 3):
+            compact = tail
+
+    # If there are multiple paragraphs, prefer the last one that looks like a problem.
+    paragraphs = [part.strip(" \"'") for part in re.split(r"\n{2,}", compact) if part.strip()]
+    plausible_paragraphs = [
+        part for part in paragraphs
+        if QUESTION_START_RE.search(part) and ("$" in part or "?" in part or "\\[" in part)
+    ]
+    if plausible_paragraphs:
+        compact = plausible_paragraphs[-1]
+
+    # Cut away any leftover role-preface before the first plausible problem start.
+    start_idx = _find_problem_start(compact)
+    if start_idx is not None:
+        compact = compact[start_idx:].strip(" \"'")
+
+    # Keep only through the final sentence-ending punctuation if there is trailing junk.
+    end_matches = list(PROBLEM_END_RE.finditer(compact))
+    if end_matches:
+        compact = compact[:end_matches[-1].end()].strip(" \"'")
+
+    compact = compact.strip()
+    if not compact or _find_problem_start(compact) is None:
+        return original_question.strip()
+    return compact
 
 def load_df(file_path: pathlib.Path) -> pd.DataFrame:
     if file_path.suffix == ".csv":
@@ -381,6 +469,7 @@ def augment(
             max_completion_tokens=max_tokens,
             seed=seed,
         )
+        paraphrased = clean_augmented_question(paraphrased, question)
         return {
             **row,
             "question": paraphrased,
@@ -407,6 +496,32 @@ def augment(
 
     asyncio.run(_run())
     typer.secho(f"Done! Generated {total} augmented problems.", fg="green")
+
+
+@app.command()
+def clean_augmented_file(
+    input_file: pathlib.Path,
+    output_file: pathlib.Path | None = None,
+) -> None:
+    """Clean an existing augmented JSONL file in-place or into a new file."""
+    df = load_df(input_file)
+    required = {"question", "question_orig"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required columns in {input_file}: {sorted(missing)}")
+
+    df = df.copy()
+    df["question_raw"] = df["question"]
+    df["question"] = df.apply(
+        lambda row: clean_augmented_question(row["question"], row["question_orig"]),
+        axis=1,
+    )
+
+    target = output_file or input_file
+    with open(target, "w", encoding="utf-8") as handle:
+        for row in df.to_dict(orient="records"):
+            handle.write(json.dumps(row) + "\n")
+    typer.secho(f"Wrote cleaned augmented file to {target}.", fg="green")
 
 
 @app.command()
