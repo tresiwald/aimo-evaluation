@@ -126,6 +126,10 @@ def load_df(file_path: pathlib.Path) -> pd.DataFrame:
         raise ValueError(f"Unsupported file format: {file_path.suffix}")
 
 
+def chunked(items: list[Any], size: int) -> list[list[Any]]:
+    return [items[idx:idx + size] for idx in range(0, len(items), size)]
+
+
 class LocalHFClient:
     """Thin async wrapper around a locally loaded Hugging Face causal LM."""
 
@@ -218,6 +222,65 @@ class LocalHFClient:
             self._generate_sync,
             system_prompt,
             user_content,
+            temperature,
+            max_completion_tokens,
+            seed,
+        )
+
+    def _generate_batch_sync(
+        self,
+        system_prompts: list[str],
+        user_contents: list[str],
+        temperature: float,
+        max_completion_tokens: int | None,
+        seed: int | None,
+    ) -> list[tuple[str, None, str]]:
+        prompts = [
+            self._render_prompt(system_prompt, user_content)
+            for system_prompt, user_content in zip(system_prompts, user_contents, strict=True)
+        ]
+        inputs = self.tokenizer(prompts, return_tensors="pt", padding=True)
+        device = next(self.model.parameters()).device
+        inputs = {key: value.to(device) for key, value in inputs.items()}
+
+        generation_kwargs: dict[str, Any] = {
+            "max_new_tokens": max_completion_tokens or self.max_new_tokens_default,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "do_sample": temperature > 0,
+        }
+        if temperature > 0:
+            generation_kwargs["temperature"] = temperature
+        if seed is not None:
+            self._torch.manual_seed(seed)
+
+        with self._torch.inference_mode():
+            outputs = self.model.generate(**inputs, **generation_kwargs)
+
+        attention_mask = inputs.get("attention_mask")
+        if attention_mask is not None:
+            input_lengths = attention_mask.sum(dim=1).tolist()
+        else:
+            input_lengths = [inputs["input_ids"].shape[1]] * len(prompts)
+
+        results: list[tuple[str, None, str]] = []
+        for output, input_length in zip(outputs, input_lengths, strict=True):
+            generated_tokens = output[int(input_length):]
+            prediction = self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+            results.append((prediction, None, "stop"))
+        return results
+
+    async def generate_batch(
+        self,
+        system_prompts: list[str],
+        user_contents: list[str],
+        temperature: float,
+        max_completion_tokens: int | None,
+        seed: int | None,
+    ) -> list[tuple[str, None, str]]:
+        return await asyncio.to_thread(
+            self._generate_batch_sync,
+            system_prompts,
+            user_contents,
             temperature,
             max_completion_tokens,
             seed,
@@ -444,13 +507,11 @@ def augment(
 
     typer.secho("Initializing the client...", fg="cyan")
     client = _get_client(provider, api_model)
-    if provider == "huggingface-local" and max_concurrency != 1:
+    if provider == "huggingface-local":
         typer.secho(
-            f"Provider {provider} runs against one local model instance; overriding "
-            f"max_concurrency from {max_concurrency} to 1.",
-            fg="yellow",
+            f"Provider {provider} will use max_concurrency={max_concurrency} as the local batch size.",
+            fg="cyan",
         )
-        max_concurrency = 1
 
     records = df.to_dict(orient="records")
     total = len(records) * n_variants
@@ -685,12 +746,76 @@ def predict(
             "prediction_seed": seed,
         }
 
-    todo = list(itertools.product(records, range(n_repeats)))
-    #random.shuffle(todo)
-    coros = (_make_coro(row, i, existing_df) for row, i in todo)
+    async def _make_local_batch(batch: list[tuple[dict, int]]) -> list[dict | None]:
+        todo_batch: list[tuple[dict, int, int | None]] = []
+        for row, repeat_idx in batch:
+            if existing_df is not None and len(existing_df) > 0:
+                existing_rows = existing_df[
+                    (existing_df["id"] == row["id"])
+                    & (existing_df["question"] == row["question"])
+                    & (existing_df["prediction_repeat_idx"] == repeat_idx)
+                    & (existing_df["prediction"] != "")
+                ]
+                if len(existing_rows) > 0:
+                    typer.secho(
+                        f"Prediction for problem {row['id']} repeat {repeat_idx} already exists, skipping...",
+                        fg="yellow",
+                    )
+                    continue
+            seed = master_rng.randint(0, 2**32 - 1) if master_rng is not None else None
+            todo_batch.append((row, repeat_idx, seed))
 
+        if not todo_batch:
+            return [None] * len(batch)
+
+        batch_seed = todo_batch[0][2]
+        outputs = await client.generate_batch(
+            system_prompts=[system_prompt] * len(todo_batch),
+            user_contents=[row["question"] for row, _, _ in todo_batch],
+            temperature=temperature,
+            max_completion_tokens=max_tokens,
+            seed=batch_seed,
+        )
+
+        output_map: dict[tuple[str, int], dict] = {}
+        for (row, repeat_idx, seed), (prediction, reasoning_content, finish_reason) in zip(todo_batch, outputs, strict=True):
+            output_map[(row["id"], repeat_idx)] = {
+                **row,
+                "prediction": prediction,
+                "predicted_result": extract_answer(prediction),
+                "prediction_api_model": api_model,
+                "prediction_system_prompt": system_prompt,
+                "prediction_reasoning_effort": reasoning_effort,
+                "prediction_repeat_idx": repeat_idx,
+                "prediction_temperature": temperature,
+                "prediction_max_tokens": max_tokens,
+                "prediction_provider": provider,
+                "prediction_reasoning_content": reasoning_content,
+                "prediction_finish_reason": finish_reason,
+                "prediction_seed": seed,
+            }
+
+        results: list[dict | None] = []
+        for row, repeat_idx in batch:
+            results.append(output_map.get((row["id"], repeat_idx)))
+        return results
+
+    todo = list(itertools.product(records, range(n_repeats)))
     async def _run() -> None:
         with open(pred_file, "a", buffering=1) as f, tqdm.tqdm(total=total, desc="generating predictions") as pbar:
+            if isinstance(client, LocalHFClient):
+                for batch in chunked(todo, max_concurrency):
+                    results = await _make_local_batch(batch)
+                    for result in results:
+                        pbar.update(1)
+                        pbar.refresh()
+                        if result is None:
+                            continue
+                        f.write(json.dumps(result) + "\n")
+                        f.flush()
+                return
+
+            coros = (_make_coro(row, i, existing_df) for row, i in todo)
             async for result in run_bounded(coros, max_concurrency):
                 pbar.update(1)
                 pbar.refresh()
