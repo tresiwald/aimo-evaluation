@@ -634,6 +634,7 @@ def predict(
     pred_dir: pathlib.Path,
     n_repeats: int = 1,
     max_concurrency: int = typer.Option(100),
+    local_hf_batch_size: int | None = typer.Option(None),
     provider: str = "openai",
     api_model: str = "gpt-5.2-2025-12-11",
     temperature: float = 1.0,
@@ -687,13 +688,18 @@ def predict(
 
     typer.secho("Initializing the client...", fg="cyan")
     client = _get_client(provider, api_model)
-    if provider == "huggingface-local" and max_concurrency != 1:
+    effective_local_hf_batch_size = local_hf_batch_size or 1
+    if provider == "huggingface-local":
+        if effective_local_hf_batch_size <= 0:
+            raise ValueError(
+                f"local_hf_batch_size must be positive when provided, got {effective_local_hf_batch_size}"
+            )
         typer.secho(
-            f"Provider {provider} runs against one local model instance; overriding "
-            f"max_concurrency from {max_concurrency} to 1.",
-            fg="yellow",
+            "Provider huggingface-local will use "
+            f"local_hf_batch_size={effective_local_hf_batch_size} "
+            f"and ignore max_concurrency={max_concurrency}.",
+            fg="cyan",
         )
-        max_concurrency = 1
 
     if row_offset > 0 or max_rows is not None:
         end_idx = None if max_rows is None else row_offset + max_rows
@@ -804,7 +810,7 @@ def predict(
     async def _run() -> None:
         with open(pred_file, "a", buffering=1) as f, tqdm.tqdm(total=total, desc="generating predictions") as pbar:
             if isinstance(client, LocalHFClient):
-                for batch in chunked(todo, max_concurrency):
+                for batch in chunked(todo, effective_local_hf_batch_size):
                     results = await _make_local_batch(batch)
                     for result in results:
                         pbar.update(1)
