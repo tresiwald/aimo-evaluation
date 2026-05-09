@@ -31,6 +31,9 @@ QUESTION_START_RE = re.compile(
     r")\b"
 )
 PROBLEM_END_RE = re.compile(r"(?s)[.?!](?:[)\]\"']+)?(?:\s|$)")
+OBVIOUS_NOISE_RE = re.compile(
+    r"(?is)<\||\b(?:analysis|assistant|final)\b|(?:\.\s*){6,}|(?:…\s*){4,}|(?:\b(?:we|okay|sure|certainly)\b\s*[.]{2,})"
+)
 
 
 def sanitize_filename_component(value: str) -> str:
@@ -73,6 +76,7 @@ def clean_augmented_question(raw_text: str, original_question: str) -> str:
         and "assistant" not in text.lower()
         and "analysis" not in text.lower()
         and _find_problem_start(text) in (None, 0)
+        and not OBVIOUS_NOISE_RE.search(text)
     ):
         return text
 
@@ -107,7 +111,7 @@ def clean_augmented_question(raw_text: str, original_question: str) -> str:
         compact = compact[:end_matches[-1].end()].strip(" \"'")
 
     compact = compact.strip()
-    if not compact or _find_problem_start(compact) is None:
+    if not compact or _find_problem_start(compact) is None or OBVIOUS_NOISE_RE.search(compact):
         return original_question.strip()
     return compact
 
@@ -522,6 +526,45 @@ def clean_augmented_file(
         for row in df.to_dict(orient="records"):
             handle.write(json.dumps(row) + "\n")
     typer.secho(f"Wrote cleaned augmented file to {target}.", fg="green")
+
+
+@app.command()
+def clean_augmented_dir(
+    input_dir: pathlib.Path,
+    glob_pattern: str = "*.jsonl",
+    in_place: bool = True,
+) -> None:
+    """Clean every augmented JSONL file in a directory."""
+    assert input_dir.is_dir(), f"Not a directory: {input_dir}"
+    cleaned_files = 0
+    skipped_files = 0
+
+    for path in sorted(input_dir.glob(glob_pattern)):
+        try:
+            df = load_df(path)
+        except Exception:
+            skipped_files += 1
+            continue
+        if "question" not in df.columns or "question_orig" not in df.columns:
+            skipped_files += 1
+            continue
+
+        target = path if in_place else path.with_name(f"{path.stem}.cleaned{path.suffix}")
+        df = df.copy()
+        df["question_raw"] = df["question"]
+        df["question"] = df.apply(
+            lambda row: clean_augmented_question(row["question"], row["question_orig"]),
+            axis=1,
+        )
+        with open(target, "w", encoding="utf-8") as handle:
+            for row in df.to_dict(orient="records"):
+                handle.write(json.dumps(row) + "\n")
+        cleaned_files += 1
+
+    typer.secho(
+        f"Cleaned {cleaned_files} augmented files in {input_dir}; skipped {skipped_files}.",
+        fg="green",
+    )
 
 
 @app.command()
