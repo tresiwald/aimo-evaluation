@@ -151,7 +151,7 @@ class LocalHFClient:
         if dtype_name != "auto":
             if not hasattr(torch, dtype_name):
                 raise ValueError(f"Unsupported LOCAL_HF_TORCH_DTYPE={dtype_name!r}")
-            model_kwargs["torch_dtype"] = getattr(torch, dtype_name)
+            model_kwargs["dtype"] = getattr(torch, dtype_name)
         attn_impl = os.getenv("LOCAL_HF_ATTN_IMPLEMENTATION")
         if attn_impl:
             model_kwargs["attn_implementation"] = attn_impl
